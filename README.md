@@ -14,7 +14,10 @@
 6. `/stoichiometry/plan` 做反向投料规划：按一个或多个生成物的目标摩尔数，
    取各目标量/配平系数的最大值得到满足全部目标的最小反应进度，给出各反应物
    理论需求量、各目标产物达成量与超额量；
-7. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+7. `/stoichiometry/sequence` 做连续反应推演：给定初始物种摩尔库存与按顺序
+   执行的多步反应，逐步以当前库存计算最大反应进度、扣减反应物、加入产物并
+   把更新后的库存传给下一步，库存不足的步骤以零进度继续并标出全部阻塞反应物；
+8. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -61,6 +64,24 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
        "targets":[{"species":"NH3","moles":"4"}]}'
 ```
 
+连续反应推演——初始库存依次经过多步反应：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "steps": [
+      {"reactants": ["SO2", "O2"], "products": ["SO3"]},
+      {"reactants": ["SO3", "H2O"], "products": ["H2SO4"]}
+    ],
+    "initial_inventory": [
+      {"species": "SO2", "moles": "4"},
+      {"species": "O2",  "moles": "10"},
+      {"species": "H2O", "moles": "3"}
+    ]
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -73,7 +94,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 175 个测试
+pytest          # 199 个测试
 ```
 
 ---
@@ -87,6 +108,7 @@ pytest          # 175 个测试
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
 | POST | `/api/v1/stoichiometry/batch` | 投料摩尔数批量计量：反应进度、并列限量试剂、消耗/剩余与理论产量 |
 | POST | `/api/v1/stoichiometry/plan` | 反向投料规划：按生成物目标摩尔数求最小反应进度、理论投料需求与达成/超额量 |
+| POST | `/api/v1/stoichiometry/sequence` | 连续反应推演：初始摩尔库存依次经过多步唯一配平反应，逐步扣减/产出并返回各步明细与最终库存 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -387,7 +409,136 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/plan \
 | 摩尔数非法：负数、`NaN`、`Infinity`、非数字字符串或 JSON 数字（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
 | 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
 
-### 2.6 幂等与查询
+### 2.6 连续反应推演 `POST /api/v1/stoichiometry/sequence`
+
+给定**初始物种摩尔库存**与**按顺序执行的多步反应**（1～100 步），服务端对
+每一步复用与 `/balance` 完全相同的解析与**唯一配平**，然后：
+
+* 以该步**全部反应物的当前库存**计算最大反应进度
+  ξ = min(**当前库存 ÷ 配平系数**)（库存中缺失的反应物按 0 计）；
+* 扣减各反应物消耗（ξ·系数）、加入各产物产出（ξ·系数），更新后的库存传给
+  下一步；
+* **库存不足时该步以零进度继续**：ξ = `"0"`、`blocked=true`，全部零库存
+  反应物列入 `blocking_reactants`，不发生任何扣减/产出，后续步骤照常执行；
+* 数量全程为**非负十进制字符串**与精确有理数（`Fraction`）运算，不经过
+  `float`；无限小数按 28 位有效数字银行家舍入；
+* **等价化学式合并为同一库存物种**（按元素组成 + 电荷的规范键，与括号风格、
+  书写顺序无关）；初始库存中的等价写法摩尔数相加，跨步骤充任不同角色的同一
+  物种（如上一步的产物成为下一步的反应物）也共用同一库存条目。
+
+请求体包含 `steps`（每项与 `/balance` 请求相同的 `reactants`/`products`）
+与 `initial_inventory`（每项 `{"species", "moles"}`，同 `/batch` 的
+`amounts` 格式；等价写法会合并，无需去重）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "steps": [
+      {"reactants": ["SO2", "O2"], "products": ["SO3"]},
+      {"reactants": ["SO3", "H2O"], "products": ["H2SO4"]}
+    ],
+    "initial_inventory": [
+      {"species": "SO2", "moles": "4"},
+      {"species": "O2",  "moles": "10"},
+      {"species": "H2O", "moles": "3"}
+    ]
+  }'
+```
+
+`2SO2 + O2 -> 2SO3` 第一步 ξ=2（SO2 限量）产出 4 mol SO3、剩余 8 mol O2；
+第二步 `SO3 + H2O -> H2SO4` ξ=3（H2O 限量）。`200` 响应：
+
+```json
+{
+  "steps": [
+    {
+      "step": 1,
+      "reaction_id": "rxn_……",
+      "cached": false,
+      "normalized": {
+        "reactants": ["O2", "SO2"],
+        "products": ["SO3"],
+        "equation": "O2 + 2SO2 -> 2SO3"
+      },
+      "reaction_extent": {"value": "2", "unit": "mol"},
+      "blocked": false,
+      "blocking_reactants": [],
+      "reactants": [
+        {"input": "O2", "normalized": "O2", "coefficient": 1,
+         "before": "10", "consumed": "2", "remaining": "8", "is_blocking": false},
+        {"input": "SO2", "normalized": "SO2", "coefficient": 2,
+         "before": "4", "consumed": "4", "remaining": "0", "is_blocking": false}
+      ],
+      "products": [
+        {"input": "SO3", "normalized": "SO3", "coefficient": 2,
+         "before": "0", "produced": "4", "after": "4"}
+      ]
+    },
+    {
+      "step": 2,
+      "reaction_id": "rxn_……",
+      "cached": false,
+      "normalized": {
+        "reactants": ["H2O", "SO3"],
+        "products": ["H2SO4"],
+        "equation": "H2O + SO3 -> H2SO4"
+      },
+      "reaction_extent": {"value": "3", "unit": "mol"},
+      "blocked": false,
+      "blocking_reactants": [],
+      "reactants": [
+        {"input": "H2O", "normalized": "H2O", "coefficient": 1,
+         "before": "3", "consumed": "3", "remaining": "0", "is_blocking": false},
+        {"input": "SO3", "normalized": "SO3", "coefficient": 1,
+         "before": "4", "consumed": "3", "remaining": "1", "is_blocking": false}
+      ],
+      "products": [
+        {"input": "H2SO4", "normalized": "H2SO4", "coefficient": 1,
+         "before": "0", "produced": "3", "after": "3"}
+      ]
+    }
+  ],
+  "initial_inventory": [
+    {"input": "H2O", "normalized": "H2O", "moles": "3"},
+    {"input": "O2", "normalized": "O2", "moles": "10"},
+    {"input": "SO2", "normalized": "SO2", "moles": "4"}
+  ],
+  "final_inventory": [
+    {"input": "H2O", "normalized": "H2O", "moles": "0"},
+    {"input": "H2SO4", "normalized": "H2SO4", "moles": "3"},
+    {"input": "O2", "normalized": "O2", "moles": "8"},
+    {"input": "SO2", "normalized": "SO2", "moles": "0"},
+    {"input": "SO3", "normalized": "SO3", "moles": "1"}
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `steps[].step` | 从 1 开始的步骤序号 |
+| `steps[].reaction_id` / `cached` | 该步反应的幂等 ID 与配平缓存命中情况（与 `/balance` 共享签名） |
+| `steps[].reaction_extent` | 该步最大反应进度 ξ（按执行前库存计算） |
+| `steps[].blocked` / `blocking_reactants` | 库存不足（至少一种反应物为 0）时为 `true`；后者列出全部零库存反应物的规范化化学式 |
+| `steps[].reactants[].before/consumed/remaining` | 该反应物在本步执行前库存、消耗与执行后库存（mol） |
+| `steps[].products[].before/produced/after` | 该产物在本步执行前库存、产出与执行后库存（mol） |
+| `initial_inventory` | 合并等价物种后的初始库存（规范化顺序） |
+| `final_inventory` | 全部步骤完成后的最终库存：包含初始物种与各步出现过的全部物种（耗尽或未产出为 `"0"`） |
+
+错误沿用统一结构化格式；某一步配平失败时 `details` 额外携带从 1 开始的
+`step` 与从 0 开始的 `step_index`，且不会执行其后的步骤：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 初始库存物种无法解析（`details.field=initial_inventory.species`） | `400 FORMULA_PARSE_ERROR` |
+| 某步反应式无法解析（`details.step/step_index`） | `400 FORMULA_PARSE_ERROR` |
+| 某步同侧物种重复 | `409 DUPLICATE_SPECIES` |
+| 初始库存摩尔数非法（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
+| 某步无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+
+### 2.7 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -459,7 +610,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法 |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/sequence` 步骤为空/超过 100 步、初始库存为空或摩尔数非法（某步配平失败时 `details` 带 `step/step_index`） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -488,11 +639,11 @@ app/
   parser.py         递归下降化学式解析（元素/括号/电荷/电子）
   balancer.py       守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
   cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
-  stoichiometry.py  投料量 -> 反应进度（正向批量计量）与目标产量 -> 最小反应进度/理论投料（反向规划），Decimal 精确计算
+  stoichiometry.py  投料量 -> 反应进度（正向批量计量）、目标产量 -> 最小反应进度/理论投料（反向规划）与连续反应单步库存推演（sequence），Decimal/Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划共 175 个测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、连续反应推演共 199 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

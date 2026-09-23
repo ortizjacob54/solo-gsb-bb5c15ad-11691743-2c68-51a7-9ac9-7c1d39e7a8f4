@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 from .balancer import (
@@ -17,7 +18,14 @@ from .balancer import (
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .parser import FormulaError, parse_formula
-from .stoichiometry import compute_reverse_plan, compute_stoichiometry, parse_moles
+from .stoichiometry import (
+    compute_reverse_plan,
+    compute_sequence_step,
+    compute_stoichiometry,
+    decimal_to_fraction,
+    fraction_to_decimal_string,
+    parse_moles,
+)
 
 
 # 错误码 -> HTTP 状态码
@@ -605,4 +613,134 @@ def process_reverse_plan(
         "cached": cached,
         "normalized": balance_payload["normalized"],
         **result,
+    }
+
+
+# ------------------------------------------------------------ 连续反应推演
+def _inventory_entry(
+    registry: dict[str, Species], key: str, inventory: dict[str, Fraction]
+) -> dict[str, Any]:
+    sp = registry[key]
+    return {
+        "input": sp.raw,
+        "normalized": sp.normalized,
+        "moles": fraction_to_decimal_string(inventory[key]),
+    }
+
+
+def process_stoichiometry_sequence(
+    step_items: list[dict[str, Any]],
+    inventory_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """连续反应推演，返回 (http_status, payload)。
+
+    先把初始库存解析为按规范键合并的精确有理数库存（等价写法相加），随后
+    按顺序对每一步复用 :func:`process_balance` 的解析、唯一配平与幂等缓存；
+    配平失败时在结构化错误 ``details`` 中补充从 1 开始的 ``step`` 与从 0
+    开始的 ``step_index``。配平成功的步骤以该步全部反应物的当前库存计算
+    最大反应进度、扣减消耗、加入产物，并把更新后的库存传给下一步。
+    """
+    # ---- 初始库存：解析、校验，等价物种合并（摩尔数精确相加）
+    inventory: dict[str, Fraction] = {}
+    registry: dict[str, Species] = {}
+    invalid_moles: list[dict[str, str]] = []
+
+    for item in inventory_items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "initial_inventory.species", "input": species_text},
+                ),
+            }
+        key = None
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_moles.append(
+                {"species": formula.normalized, "moles": moles_text}
+            )
+        else:
+            sp = Species(
+                raw=species_text, normalized=formula.normalized, formula=formula
+            )
+            key = species_key(sp)
+            inventory[key] = inventory.get(key, Fraction(0)) + decimal_to_fraction(
+                amount
+            )
+            registry.setdefault(key, sp)
+
+    if invalid_moles:
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "初始库存摩尔数必须是非负十进制字符串（不能为 JSON 数字）；"
+                "等价化学式会合并为同一库存物种（摩尔数相加）",
+                {"invalid_moles": invalid_moles},
+            ),
+        }
+
+    def inventory_snapshot(keys: list[str]) -> list[dict[str, Any]]:
+        return [_inventory_entry(registry, key, inventory) for key in keys]
+
+    initial_keys = sorted(inventory, key=lambda k: registry[k].formula.key)
+    initial_inventory = inventory_snapshot(initial_keys)
+
+    # ---- 按顺序执行各步
+    step_results: list[dict[str, Any]] = []
+    for index, step in enumerate(step_items):
+        reactant_texts = step["reactants"]
+        product_texts = step["products"]
+        status, balance_payload = process_balance(reactant_texts, product_texts)
+        if status != 200:
+            error = dict(balance_payload["error"])
+            error["details"] = {
+                **error.get("details", {}),
+                "step": index + 1,
+                "step_index": index,
+            }
+            return status, {
+                **{k: v for k, v in balance_payload.items() if k != "error"},
+                "error": error,
+            }
+
+        # parse_side 已按规范键排序，与配平向量顺序一致
+        reactants = list(parse_side(reactant_texts, "反应物"))
+        products = list(parse_side(product_texts, "生成物"))
+        for sp in (*reactants, *products):
+            registry.setdefault(species_key(sp), sp)
+        coefficient_map = {
+            species_key(sp): coef
+            for sp, coef in zip(
+                (*reactants, *products),
+                balance_payload["coefficients"]["vector"],
+            )
+        }
+
+        result = compute_sequence_step(
+            reactants, products, coefficient_map, inventory
+        )
+        step_results.append(
+            {
+                "step": index + 1,
+                "reaction_id": balance_payload["reaction_id"],
+                "cached": balance_payload["cached"],
+                "normalized": balance_payload["normalized"],
+                **result,
+            }
+        )
+
+    # 最终库存：初始物种 + 各步出现过的全部物种，按规范键排序
+    final_keys = sorted(registry, key=lambda k: registry[k].formula.key)
+    final_inventory = inventory_snapshot(final_keys)
+
+    return 200, {
+        "steps": step_results,
+        "initial_inventory": initial_inventory,
+        "final_inventory": final_inventory,
     }

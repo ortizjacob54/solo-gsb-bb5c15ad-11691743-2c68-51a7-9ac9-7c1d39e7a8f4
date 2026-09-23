@@ -288,3 +288,92 @@ class ReversePlanResponse(BaseModel):
         description="客户端提交的各目标产物：目标量、达成量与超额量"
     )
     products: list[PlanProductResult] = Field(description="全部生成物的达成量")
+
+
+# ------------------------------------------------------------ 连续反应推演
+class SequenceReactionStep(ReactionRequest):
+    """连续推演中的一步反应：与 ``/balance`` 相同的反应物 / 生成物列表。"""
+
+
+class InventoryAmount(StoichAmount):
+    """连续推演初始库存中的一条物种摩尔数记录（复用非负十进制字符串校验）。"""
+
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="库存物种化学式；等价写法（括号风格、空白、电荷写法不同）"
+        "会被识别为同一物种并合并库存",
+        examples=["H2"],
+    )
+
+
+class SequenceRequest(BaseModel):
+    """``/stoichiometry/sequence`` 请求：按顺序执行的多步反应 + 初始库存。"""
+
+    steps: list[SequenceReactionStep] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="按顺序执行的反应步骤（1～100 步）；每步先做唯一配平，"
+        "再以上一步结束后的库存计算最大反应进度",
+    )
+    initial_inventory: list[InventoryAmount] = Field(
+        ...,
+        min_length=1,
+        description="初始物种摩尔库存；等价化学式合并为同一库存物种（摩尔数相加），"
+        "摩尔数为非负十进制字符串",
+    )
+
+
+class SequenceReactantResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    before: str = Field(description="该步执行前的库存摩尔数")
+    consumed: str = Field(description="本步消耗量 = 反应进度 × 系数（mol）")
+    remaining: str = Field(description="该步执行后的库存 = before − consumed（mol）")
+    is_blocking: bool = Field(
+        description="该步库存是否不足（库存为 0）；为 true 时本步反应进度为 0"
+    )
+
+
+class SequenceProductResult(BaseModel):
+    input: str
+    normalized: str
+    coefficient: int
+    before: str = Field(description="该步执行前的库存摩尔数")
+    produced: str = Field(description="本步产出量 = 反应进度 × 系数（mol）")
+    after: str = Field(description="该步执行后的库存 = before + produced（mol）")
+
+
+class SequenceStepResult(BaseModel):
+    step: int = Field(description="从 1 开始的步骤序号")
+    reaction_id: str = Field(description="该步反应的幂等 ID（与 /balance 共享签名）")
+    cached: bool = Field(description="该步配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    reaction_extent: ReactionExtent
+    blocked: bool = Field(
+        description="该步是否因库存不足而以零进度继续（至少一种反应物库存为 0）"
+    )
+    blocking_reactants: list[str] = Field(
+        description="该步全部阻塞反应物的规范化化学式（库存为 0 的反应物）"
+    )
+    reactants: list[SequenceReactantResult] = Field(description="各反应物扣减明细")
+    products: list[SequenceProductResult] = Field(description="各生成物产出明细")
+
+
+class InventoryEntry(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    moles: str = Field(description="该库存物种的摩尔数（非负十进制字符串）")
+
+
+class SequenceResponse(BaseModel):
+    steps: list[SequenceStepResult] = Field(description="按请求顺序的各步推演结果")
+    initial_inventory: list[InventoryEntry] = Field(
+        description="合并等价物种后的初始库存（规范化顺序）"
+    )
+    final_inventory: list[InventoryEntry] = Field(
+        description="全部步骤执行完毕后的最终库存；包含初始库存物种与各步出现过的"
+        "全部物种（耗尽或未产出的为 \"0\"），按规范化顺序排列"
+    )

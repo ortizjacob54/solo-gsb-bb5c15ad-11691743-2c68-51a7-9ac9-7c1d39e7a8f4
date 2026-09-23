@@ -17,6 +17,13 @@
   * 每种生成物在该进度下的实际达成量；目标产物同时给出目标量与
     超额量（达成 − 目标，非目标产物超额量为 null）。
 
+* 连续反应推演：:func:`compute_sequence_step`
+  给定一步已唯一配平的反应与当前各物种摩尔库存（按规范键索引的
+  :class:`fractions.Fraction`），以该步全部反应物的当前库存计算最大反应进度
+  ξ = min(库存 ÷ 配平系数)，就地扣减消耗、加入产物，返回该步的进度、
+  阻塞反应物（库存为 0 时 ξ=0，全部零库存反应物均为阻塞物）与
+  消耗/产出明细。等价化学式共享同一规范键，因此天然合并为同一库存物种。
+
 为避免浮点误差，输入十进制先无损转成 :class:`fractions.Fraction`，
 比较与极值判定全部使用精确有理数；最终结果再按
 :class:`decimal.Decimal`（28 位有效数字）格式化为字符串返回。
@@ -294,5 +301,90 @@ def compute_reverse_plan(
                            if block["is_driving"]],
         "reactants": reactant_blocks,
         "targets": target_blocks,
+        "products": product_blocks,
+    }
+
+
+# ------------------------------------------------------------ 连续反应单步推演
+def compute_sequence_step(
+    reactants: Iterable[Species],
+    products: Iterable[Species],
+    coefficients: dict[str, int],
+    inventory: dict[str, Fraction],
+) -> dict:
+    """在给定库存上执行一步已唯一配平的反应，返回该步推演明细。
+
+    ``coefficients`` 与 ``inventory`` 均以 :func:`app.cache.species_key` 为键；
+    库存中缺失的反应物视为 0。最大反应进度
+    ξ = min(当前库存 ÷ 配平系数)（仅按该步全部反应物计），随后：
+
+    * 每种反应物扣减 ξ·系数（库存不足时 ξ=0，全部零库存反应物列为
+      ``blocking_reactants``，扣减/产出均为 0，库存原样进入下一步）；
+    * 每种生成物加入 ξ·系数；等价化学式共享同一规范键，因此反应中充任
+      反应物或生成物的同一物种（包括跨步骤）合并到同一库存条目。
+
+    ``inventory`` 会被原地更新（键始终保留，耗尽时值为 0）。返回值中的
+    消耗/产出与库存余额均为十进制字符串。物种按规范键排序输出，
+    调换同一反应的书写顺序得到完全一致的结果。
+    """
+    reactants = sorted(reactants, key=lambda sp: sp.formula.key)
+    products = sorted(products, key=lambda sp: sp.formula.key)
+
+    ratios: dict[str, Fraction] = {
+        species_key(sp): inventory.get(species_key(sp), Fraction(0))
+        / coefficients[species_key(sp)]
+        for sp in reactants
+    }
+    extent = min(ratios.values())
+    blocking = {key for key, ratio in ratios.items() if ratio == 0}
+
+    reactant_blocks: list[dict] = []
+    for sp in reactants:
+        key = species_key(sp)
+        coef = coefficients[key]
+        before = inventory.get(key, Fraction(0))
+        consumed = extent * coef
+        inventory[key] = before - consumed
+        reactant_blocks.append(
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": coef,
+                "before": fraction_to_decimal_string(before),
+                "consumed": fraction_to_decimal_string(consumed),
+                "remaining": fraction_to_decimal_string(inventory[key]),
+                "is_blocking": key in blocking,
+            }
+        )
+
+    product_blocks: list[dict] = []
+    for sp in products:
+        key = species_key(sp)
+        coef = coefficients[key]
+        before = inventory.get(key, Fraction(0))
+        produced = extent * coef
+        inventory[key] = before + produced
+        product_blocks.append(
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": coef,
+                "before": fraction_to_decimal_string(before),
+                "produced": fraction_to_decimal_string(produced),
+                "after": fraction_to_decimal_string(inventory[key]),
+            }
+        )
+
+    return {
+        "reaction_extent": {
+            "value": fraction_to_decimal_string(extent),
+            "unit": "mol",
+        },
+        "blocked": extent == 0,
+        "blocking_reactants": [
+            block["normalized"] for block in reactant_blocks
+            if block["is_blocking"]
+        ],
+        "reactants": reactant_blocks,
         "products": product_blocks,
     }

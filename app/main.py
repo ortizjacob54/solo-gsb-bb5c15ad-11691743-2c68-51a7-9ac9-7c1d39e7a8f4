@@ -9,6 +9,8 @@
   各反应物消耗/剩余与各生成物理论产量；
 * ``POST /stoichiometry/plan``  生成物目标摩尔数 -> 最小反应进度、
   各反应物理论需求量、各目标产物达成量与超额量；
+* ``POST /stoichiometry/sequence`` 多步连续反应推演：初始物种摩尔库存
+  依次经过每一步的唯一配平反应，逐步扣减/产出并返回最终库存；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -26,6 +28,8 @@ from .models import (
     ReactionRequest,
     ReversePlanRequest,
     ReversePlanResponse,
+    SequenceRequest,
+    SequenceResponse,
     StoichiometryResponse,
     StoichiometryRequest,
     VariantRequest,
@@ -38,6 +42,7 @@ from .service import (
     process_balance,
     process_reverse_plan,
     process_stoichiometry,
+    process_stoichiometry_sequence,
     process_variants,
 )
 
@@ -149,6 +154,25 @@ async def stoichiometry_plan(request: ReversePlanRequest):
         request.reactants,
         request.products,
         [item.model_dump() for item in request.targets],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/sequence",
+    response_model=SequenceResponse,
+    tags=["计量"],
+    summary="连续反应推演：多步反应顺序扣减/产出，逐步更新摩尔库存",
+    responses={
+        400: {"description": "化学式或初始库存物种解析失败"},
+        409: {"description": "某步反应同侧重复物种"},
+        422: {"description": "某步无法唯一配平 / 初始库存摩尔数非法 / 请求非法"},
+    },
+)
+async def stoichiometry_sequence(request: SequenceRequest):
+    status, payload = process_stoichiometry_sequence(
+        [step.model_dump() for step in request.steps],
+        [item.model_dump() for item in request.initial_inventory],
     )
     return JSONResponse(status_code=status, content=payload)
 
