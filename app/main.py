@@ -9,6 +9,9 @@
   各反应物消耗/剩余与各生成物理论产量；
 * ``POST /stoichiometry/plan``  生成物目标摩尔数 -> 最小反应进度、
   各反应物理论需求量、各目标产物达成量与超额量；
+* ``POST /stoichiometry/sequence`` 多步连续反应推演：按顺序执行多步
+  反应，基于初始物种库存逐步计算最大反应进度、扣减消耗、加入产物，
+  返回各步明细与最终库存；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -26,6 +29,8 @@ from .models import (
     ReactionRequest,
     ReversePlanRequest,
     ReversePlanResponse,
+    SequenceRequest,
+    SequenceResponse,
     StoichiometryResponse,
     StoichiometryRequest,
     VariantRequest,
@@ -37,6 +42,7 @@ from .service import (
     process_analyze,
     process_balance,
     process_reverse_plan,
+    process_sequence,
     process_stoichiometry,
     process_variants,
 )
@@ -51,6 +57,18 @@ app = FastAPI(
 )
 
 
+def _jsonable_errors(errors: list[dict]) -> list[dict]:
+    """剔除 Pydantic v2 校验错误里不可 JSON 序列化的原始异常（ctx.error）。"""
+    clean: list[dict] = []
+    for err in errors:
+        item = dict(err)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict) and "error" in ctx:
+            item["ctx"] = {**ctx, "error": str(ctx["error"])}
+        clean.append(item)
+    return clean
+
+
 @app.exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError):
     return JSONResponse(
@@ -59,7 +77,7 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
             "error": {
                 "code": "INVALID_REQUEST",
                 "message": "请求体校验失败：请提供非空的 reactants 与 products 字符串数组",
-                "details": {"validation": exc.errors()},
+                "details": {"validation": _jsonable_errors(exc.errors())},
             }
         },
     )
@@ -149,6 +167,25 @@ async def stoichiometry_plan(request: ReversePlanRequest):
         request.reactants,
         request.products,
         [item.model_dump() for item in request.targets],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/sequence",
+    response_model=SequenceResponse,
+    tags=["计量"],
+    summary="连续反应推演：多步反应按顺序消耗/产出，逐步传递物种库存",
+    responses={
+        400: {"description": "化学式解析失败（反应式或初始库存物种）"},
+        409: {"description": "某步同侧重复物种"},
+        422: {"description": "某步无法唯一配平 / 步骤为空 / 库存摩尔数非法"},
+    },
+)
+async def stoichiometry_sequence(request: SequenceRequest):
+    status, payload = process_sequence(
+        [item.model_dump() for item in request.steps],
+        [item.model_dump() for item in request.initial_inventory],
     )
     return JSONResponse(status_code=status, content=payload)
 

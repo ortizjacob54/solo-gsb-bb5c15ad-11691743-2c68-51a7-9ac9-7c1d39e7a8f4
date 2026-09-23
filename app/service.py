@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 from .balancer import (
@@ -17,7 +18,14 @@ from .balancer import (
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .parser import FormulaError, parse_formula
-from .stoichiometry import compute_reverse_plan, compute_stoichiometry, parse_moles
+from .stoichiometry import (
+    apply_sequence_step,
+    compute_reverse_plan,
+    compute_stoichiometry,
+    decimal_to_fraction,
+    fraction_to_decimal_string,
+    parse_moles,
+)
 
 
 # 错误码 -> HTTP 状态码
@@ -605,4 +613,139 @@ def process_reverse_plan(
         "cached": cached,
         "normalized": balance_payload["normalized"],
         **result,
+    }
+
+
+# ------------------------------------------------------------ 多步连续反应推演
+def _step_error(
+    step_index: int, payload: dict[str, Any], status: int
+) -> tuple[int, dict[str, Any]]:
+    """给单步配平的结构化错误补充步骤序号（不改动缓存内的错误对象）。"""
+    body = dict(payload)
+    error = dict(body["error"])
+    details = dict(error.get("details") or {})
+    details["step"] = step_index
+    error["details"] = details
+    body["error"] = error
+    return status, body
+
+
+def _render_inventory(
+    inventory: dict[str, Fraction], normalized_by_key: dict[str, str]
+) -> list[dict[str, str]]:
+    """把规范键 -> Fraction 的库存渲染为按规范化化学式排序的记录列表。"""
+    return [
+        {
+            "normalized": normalized_by_key[key],
+            "moles": fraction_to_decimal_string(inventory[key]),
+        }
+        for key in sorted(inventory, key=lambda k: normalized_by_key[k])
+    ]
+
+
+def process_sequence(
+    step_items: list[dict[str, Any]],
+    inventory_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """多步连续反应推演，返回 (http_status, payload)。
+
+    先把初始库存条目逐条解析为精确有理数（等价化学式合并为同一物种、
+    摩尔数相加）；随后按顺序对每一步复用 :func:`process_balance` 的解析、
+    唯一配平与幂等缓存，以该步全部反应物的当前库存计算最大反应进度，
+    扣减消耗、加入产物，并把更新后的库存传给下一步。任何一步配平失败
+    都沿用其结构化错误响应并在 details 中补充 ``step`` 序号；库存物种
+    无法解析或摩尔数非法时在推演开始前聚合报 400 / 422。
+    """
+    # ---- 初始库存：逐条解析物种与摩尔数，聚合所有可定位的问题
+    invalid_moles: list[dict[str, str]] = []
+    inventory: dict[str, Fraction] = {}
+    normalized_by_key: dict[str, str] = {}
+
+    for item in inventory_items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "initial_inventory.species", "input": species_text},
+                ),
+            }
+        sp = Species(raw=species_text, normalized=formula.normalized, formula=formula)
+        key = species_key(sp)
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_moles.append(
+                {"species": formula.normalized, "moles": moles_text}
+            )
+            continue
+        # 等价化学式合并为同一库存物种，摩尔数精确相加
+        inventory[key] = inventory.get(key, Fraction(0)) + decimal_to_fraction(amount)
+        normalized_by_key.setdefault(key, formula.normalized)
+
+    if invalid_moles:
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "初始库存摩尔数必须是非负十进制字符串（不能为 JSON 数字）",
+                {"invalid_moles": invalid_moles},
+            ),
+        }
+
+    # ---- 逐步解析、配平与库存推演
+    step_results: list[dict[str, Any]] = []
+    for index, step in enumerate(step_items):
+        reactant_texts = step["reactants"]
+        product_texts = step["products"]
+        status, balance_payload = process_balance(reactant_texts, product_texts)
+        if status != 200:
+            return _step_error(index, balance_payload, status)
+
+        reaction_id = balance_payload["reaction_id"]
+        cached = balance_payload["cached"]
+
+        # parse_side 已按规范键排序，与配平向量顺序一致
+        reactants = list(parse_side(reactant_texts, "反应物"))
+        products = list(parse_side(product_texts, "生成物"))
+        coefficient_map = {
+            species_key(sp): coef
+            for sp, coef in zip(
+                (*reactants, *products),
+                balance_payload["coefficients"]["vector"],
+            )
+        }
+        for sp in (*reactants, *products):
+            normalized_by_key.setdefault(species_key(sp), sp.normalized)
+
+        outcome = apply_sequence_step(
+            reactants, products, coefficient_map, inventory
+        )
+        inventory = outcome.pop("inventory_after")
+        extent = outcome.pop("reaction_extent")
+
+        step_results.append(
+            {
+                "index": index,
+                "reaction_id": reaction_id,
+                "cached": cached,
+                "normalized": balance_payload["normalized"],
+                "reaction_extent": {
+                    "value": fraction_to_decimal_string(extent),
+                    "unit": "mol",
+                },
+                "blocked": extent == 0,
+                "blocking_reactants": outcome["blocking"],
+                "reactants": outcome["reactants"],
+                "products": outcome["products"],
+                "inventory": _render_inventory(inventory, normalized_by_key),
+            }
+        )
+
+    return 200, {
+        "steps": step_results,
+        "final_inventory": _render_inventory(inventory, normalized_by_key),
     }
